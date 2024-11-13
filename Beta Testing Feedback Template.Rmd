@@ -1,0 +1,80 @@
+# Statistical Analysis Planner App - Beta Testing Feedback Tracker
+
+## Tester Information
+- Name:
+- Role/Position:
+- Primary Area of Expertise:
+- Date Started Testing:
+- Date Completed Testing:
+
+## Assigned Testing Focus
+Primary focus area(s):
+- [ ] Statistical validity
+- [ ] User interface/experience
+- [ ] Educational value
+- [ ] Clinical applicability
+- [ ] Other: _____________
+
+## Feedback Categories
+
+### 1. Statistical Accuracy (for PhD statisticians/epidemiologists)
+- [ ] Appropriateness of recommended analyses
+- [ ] Completeness of statistical options
+- [ ] Accuracy of effect measure interpretations
+- [ ] Validity of justifications
+- [ ] Appropriateness of sample size considerations
+
+### 2. User Interface/Experience (all testers)
+- [ ] Navigation clarity
+- [ ] Logical flow of questions
+- [ ] Clarity of terminology
+- [ ] Visual appeal
+- [ ] Response time/performance
+
+### 3. Educational Value (for students/early-career researchers)
+- [ ] Clarity of explanations
+- [ ] Usefulness of examples
+- [ ] Value as a learning tool
+- [ ] Appropriateness for skill level
+- [ ] Completeness of guidance
+
+### 4. Clinical Relevance (for physician-scientists)
+- [ ] Practicality for clinical research
+- [ ] Alignment with clinical trial needs
+- [ ] Clarity for non-statisticians
+- [ ] Usefulness for grant applications
+- [ ] Integration with clinical workflow
+
+### 5. Specific Feedback
+Please provide detailed feedback on your assigned areas:
+
+1. What works well:
+   - 
+   - 
+   - 
+
+2. What needs improvement:
+   - 
+   - 
+   - 
+
+3. Missing features/capabilities:
+   - 
+   - 
+   - 
+
+4. Bugs/Issues:
+   - 
+   - 
+   - 
+
+### 6. Overall Assessment
+- Would you recommend this tool to colleagues? (1-5 scale)
+- How likely are you to use this tool in your work? (1-5 scale)
+- Additional comments:
+
+## Follow-up
+- [ ] Initial feedback received
+- [ ] Clarification questions sent
+- [ ] Final feedback received
+- [ ] Feedback incorporated into development plan
