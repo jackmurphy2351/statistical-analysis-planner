@@ -9,3 +9,10 @@ This tool helps researchers select appropriate statistical analyses based on stu
 ```r
 # Install required packages
 install.packages(c("shiny", "shinydashboard", "markdown", "DT", "rmarkdown", "officer", "survival", "MASS"))
+
+## Usage
+```r
+# Run the app locally
+shiny::runApp()
+```
+Licensed under the GNU General Public License v3.0
