@@ -15,12 +15,20 @@ library(DT)
 library(rmarkdown)
 library(officer)  # For Word document creation
 
+# =================== HELPER FUNCTIONS ===================
+
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
 # Get effect measure interpretation
 get_effect_measure_interpretation <- function(outcome_type, study_design, predictor_type, effect_measure) {
-  # First check if any inputs are NULL or empty
   if(is.null(outcome_type) || is.null(study_design) || 
      is.null(predictor_type) || is.null(effect_measure)) {
     return("Please complete all selections to see effect measure interpretation.")
+  }
+  
+  # Add new interpretation for survival time differences
+  if(outcome_type == "survival" && effect_measure == "difference") {
+    return("The difference in median survival time represents the absolute difference in the time at which 50% of subjects in each group have experienced the event. This provides a directly interpretable measure of the exposure's impact on survival in the original time scale.")
   }
   
   base_interpretation <- switch(outcome_type,
@@ -59,6 +67,411 @@ get_effect_measure_interpretation <- function(outcome_type, study_design, predic
   return(base_interpretation)
 }
 
+
+# Calculate power function
+calculate_power <- function(design, outcome, params) {
+  # Validate inputs
+  if(is.null(params$alpha) || is.null(params$sample_size)) {
+    return(list(
+      error = TRUE,
+      message = "Please complete all required fields"
+    ))
+  }
+  
+  if(outcome == "binary" && design == "case_control") {
+    # Validate case-control specific parameters
+    if(is.null(params$or) || is.null(params$p0) || is.null(params$ratio)) {
+      return(list(
+        error = TRUE,
+        message = "Please complete all required fields for case-control design"
+      ))
+    }
+    
+    # Calculate p1 from odds ratio and p0
+    p1 <- (params$or * params$p0) / (1 + params$p0 * (params$or - 1))
+    
+    # Calculate number of cases
+    n_cases <- params$sample_size / (1 + params$ratio)
+    
+    # Calculate average exposure proportion
+    p_avg <- (params$p0 + p1) / 2
+    
+    # Default to one-sided if not specified
+    params$sided_test <- if(is.null(params$sided_test)) "one" else params$sided_test
+    
+    # Get critical value based on one/two-sided test
+    z_alpha <- if(params$sided_test == "one") {
+      qnorm(1 - params$alpha)
+    } else {
+      qnorm(1 - params$alpha/2)
+    }
+    
+    if(is.null(params$match_design) || params$match_design == "unmatched") {
+      # Calculate z_beta using the correct formula for case-control studies
+      z_beta <- (sqrt(n_cases) * abs(p1 - params$p0) - 
+                   z_alpha * sqrt((1 + 1/params$ratio) * p_avg * (1-p_avg))) /
+        sqrt(p1*(1-p1)/params$ratio + params$p0*(1-params$p0))
+      
+      power <- pnorm(z_beta)
+      
+      return(list(
+        power = power,
+        power_pct = paste0(round(power * 100, 1), "%"),
+        n_cases = n_cases,
+        n_controls = n_cases * params$ratio,
+        method = paste0(
+          "Power calculation for case-control studies\n",
+          "Using ", if(params$sided_test == "one") "one" else "two",
+          "-sided test with α = ", params$alpha
+        )
+      ))
+    } else if(params$match_design == "matched") {
+      # Validate matched-specific parameters
+      if(is.null(params$phi)) {
+        return(list(
+          error = TRUE,
+          message = "Please specify the within-pair correlation for matched design"
+        ))
+      }
+      
+      # Calculate discordant pair probability
+      pi_d <- p1*(1-params$p0) + params$p0*(1-p1) - 
+        2*params$phi*sqrt(params$p0*(1-params$p0)*p1*(1-p1))
+      
+      # Calculate probability of exposure in cases given discordance
+      p1_d <- p1*(1-params$p0)/pi_d
+      
+      # Calculate power for matched design
+      z_beta <- sqrt(n_cases * pi_d) * (2*p1_d - 1) - z_alpha
+      
+      power <- pnorm(z_beta)
+      
+      return(list(
+        power = power,
+        power_pct = paste0(round(power * 100, 1), "%"),
+        n_pairs = n_cases,
+        method = paste0(
+          "Power calculation for matched case-control studies\n",
+          "Using ", if(params$sided_test == "one") "one" else "two",
+          "-sided test with α = ", params$alpha
+        )
+      ))
+    }
+  }
+  
+  else if(outcome == "continuous") {
+    if(design == "rct_crossover") {
+      # Power for paired t-test
+      effect_size <- params$diff/(params$sd * sqrt(2))
+      z_beta <- effect_size * sqrt(params$sample_size) - qnorm(1-params$alpha/2)
+      power <- pnorm(z_beta)
+      
+      list(
+        power = power,
+        power_pct = paste0(round(power * 100, 1), "%"),
+        effect_size = effect_size,
+        method = "Power calculation for crossover design"
+      )
+      
+    } else {
+      # Power for two-sample t-test
+      n1 <- params$sample_size/(1 + params$ratio)
+      n2 <- n1 * params$ratio
+      effect_size <- params$diff/params$sd
+      z_beta <- effect_size * sqrt((n1*n2)/(n1+n2)) - qnorm(1-params$alpha/2)
+      power <- pnorm(z_beta)
+      
+      list(
+        power = power,
+        power_pct = paste0(round(power * 100, 1), "%"),
+        n_group1 = n1,
+        n_group2 = n2,
+        effect_size = effect_size,
+        method = "Power calculation for two-sample t-test"
+      )
+    }
+  }
+  
+  else if(outcome == "survival") {
+    # Power for survival analysis
+    n_per_group <- params$sample_size/2
+    p_events <- params$p0 * (1-params$dropouts)
+    n_events <- n_per_group * 2 * p_events
+    
+    z_beta <- sqrt(n_events * params$p0 * (1-params$p0)) * abs(log(params$hr)) - 
+      qnorm(1-params$alpha/2)
+    power <- pnorm(z_beta)
+    
+    list(
+      power = power,
+      power_pct = paste0(round(power * 100, 1), "%"),
+      n_events_expected = n_events,
+      method = "Power calculation using Schoenfeld's formula"
+    )
+  }
+}
+
+# Sample size calculation function
+calculate_sample_size <- function(design, outcome, params) {
+  if(outcome == "binary") {
+    if(design %in% c("cohort", "cross_sectional", "rct_parallel")) {
+      # Using arc-sine transformation for proportions
+      p_avg <- (params$p0 + params$p1)/2
+      h <- 2*asin(sqrt(params$p1)) - 2*asin(sqrt(params$p0))
+      n <- ceiling((2 * (qnorm(1-params$alpha/2) + qnorm(params$power))^2) / h^2)
+      
+      list(
+        n_per_group = n,
+        total_n = 2*n,
+        method = "Arc-sine transformation for proportions"
+      )
+      
+    } else if(design == "case_control") {
+      # Validate required parameters
+      if(any(sapply(c("or", "p0", "ratio", "alpha", "power"), function(x) is.null(params[[x]])))) {
+        return(list(
+          error = TRUE,
+          message = "Please complete all required fields for case-control design"
+        ))
+      }
+      
+      # Ensure all parameters are numeric
+      tryCatch({
+        params$or <- as.numeric(params$or)
+        params$p0 <- as.numeric(params$p0)
+        params$ratio <- as.numeric(params$ratio)
+        params$alpha <- as.numeric(params$alpha)
+        params$power <- as.numeric(params$power)
+      }, error = function(e) {
+        return(list(
+          error = TRUE,
+          message = "Invalid numeric values in parameters"
+        ))
+      })
+      
+      # Calculate p1 from odds ratio and p0
+      p1 <- (params$or * params$p0)/(1 + params$p0 * (params$or - 1))
+      
+      # Calculate average exposure proportion
+      p_avg <- (params$p0 + p1)/2
+      
+      # Default to one-sided if not specified
+      params$sided_test <- if(is.null(params$sided_test)) "one" else params$sided_test
+      
+      # Get critical value based on one/two-sided test
+      z_alpha <- if(params$sided_test == "one") {
+        qnorm(1 - params$alpha)
+      } else {
+        qnorm(1 - params$alpha/2)
+      }
+      
+      if(is.null(params$match_design) || params$match_design == "unmatched") {
+        # Schlesselman's formula for unmatched case-control
+        n_cases <- ceiling(
+          (z_alpha * sqrt((1+1/params$ratio)*p_avg*(1-p_avg)) + 
+             qnorm(params$power) * sqrt(p1*(1-p1)/params$ratio + params$p0*(1-params$p0)))^2 /
+            (p1-params$p0)^2
+        )
+        
+        list(
+          n_cases = n_cases,
+          n_controls = ceiling(n_cases * params$ratio),
+          total_n = ceiling(n_cases * (1 + params$ratio)),
+          method = paste0(
+            "Schlesselman's formula for unmatched case-control studies\n",
+            "Using ", if(params$sided_test == "one") "one" else "two",
+            "-sided test with α = ", params$alpha
+          )
+        )
+        
+      } else if(params$match_design == "matched") {
+        # Validate matched-specific parameters
+        if(is.null(params$phi)) {
+          return(list(
+            error = TRUE,
+            message = "Please specify the within-pair correlation for matched design"
+          ))
+        }
+        
+        params$phi <- as.numeric(params$phi)
+        
+        # Gail's formula for matched case-control studies
+        # Calculate discordant pair probability
+        pi_d <- p1*(1-params$p0) + params$p0*(1-p1) - 
+          2*params$phi*sqrt(params$p0*(1-params$p0)*p1*(1-p1))
+        
+        # Calculate probability of exposure in cases given discordance
+        p1_d <- p1*(1-params$p0)/pi_d
+        
+        # Calculate required number of discordant pairs
+        n_pairs <- ceiling(
+          ((z_alpha + qnorm(params$power))/(2*p1_d - 1))^2 / pi_d
+        )
+        
+        list(
+          n_pairs = n_pairs,
+          total_n = 2*n_pairs,  # Total number of subjects (cases + controls)
+          method = paste0(
+            "Gail's formula for matched case-control studies (1973)\n",
+            "Using ", if(params$sided_test == "one") "one" else "two",
+            "-sided test with α = ", params$alpha
+          )
+        )
+      }
+    }
+  } else if(outcome == "continuous") {
+    if(design == "rct_crossover") {
+      # Paired t-test formula
+      n <- ceiling(2 * (qnorm(1-params$alpha/2) + qnorm(params$power))^2 * 
+                     (params$sd^2) / (params$diff^2))
+      
+      list(
+        n_total = n,
+        method = "Paired t-test formula for crossover design"
+      )
+      
+    } else {
+      # Two-sample t-test formula
+      n1 <- ceiling((1 + 1/params$ratio) * 
+                      (qnorm(1-params$alpha/2) + qnorm(params$power))^2 * 
+                      params$sd^2 / params$diff^2)
+      
+      list(
+        n_group1 = n1,
+        n_group2 = ceiling(n1 * params$ratio),
+        total_n = n1 * (1 + params$ratio),
+        method = "Two-sample t-test formula"
+      )
+    }
+  } else if(outcome == "survival") {
+    # Schoenfeld's formula for survival
+    n_events <- ceiling((qnorm(1-params$alpha/2) + qnorm(params$power))^2 / 
+                          (log(params$hr)^2 * params$p0 * (1-params$p0)))
+    
+    # Adjust for dropouts
+    n_total <- ceiling(n_events / (params$p0 * (1-params$dropouts)))
+    
+    list(
+      n_events_needed = n_events,
+      n_per_group = ceiling(n_total/2),
+      total_n = n_total,
+      method = "Schoenfeld's formula for survival analysis"
+    )
+  }
+}
+
+# Display equation function
+equation_display <- function(design, outcome) {
+  req(design, outcome)
+  
+  if(outcome == "binary") {
+    if(design == "case_control") {
+      HTML("
+        <div style='font-family: monospace; padding: 15px; background-color: #f8f9fa; border-radius: 5px;'>
+          <strong>Sample Size Formula (Unmatched Case-Control):</strong><br><br>
+          n<sub>cases</sub> = (z<sub>α</sub>√[(1+1/r)p̄(1-p̄)] + z<sub>β</sub>√[p₁(1-p₁)/r + p₀(1-p₀)])² / (p₁-p₀)²<br><br>
+          where:<br>
+          • r = control:case ratio<br>
+          • p̄ = (p₁ + p₀)/2<br>
+          • p₁ = odds ratio × p₀ / (1 + p₀(odds ratio - 1))<br>
+          • z<sub>α</sub> = one-sided or two-sided critical value<br>
+          • z<sub>β</sub> = power
+        </div>")
+    } else if(design %in% c("cohort", "cross_sectional", "rct_parallel")) {
+      HTML("
+        <div style='font-family: monospace; padding: 15px; background-color: #f8f9fa; border-radius: 5px;'>
+          <strong>Sample Size Formula (Binary Outcome):</strong><br><br>
+          n = 2(z<sub>α/2</sub> + z<sub>β</sub>)²[p₁(1-p₁) + p₀(1-p₀)] / (p₁-p₀)²<br><br>
+          where:<br>
+          • p₁ = probability in exposed/treatment group<br>
+          • p₀ = probability in unexposed/control group<br>
+          • z<sub>α/2</sub> = two-sided critical value<br>
+          • z<sub>β</sub> = power
+        </div>")
+    }
+  } else if(outcome == "continuous") {
+    if(design == "rct_crossover") {
+      HTML("
+        <div style='font-family: monospace; padding: 15px; background-color: #f8f9fa; border-radius: 5px;'>
+          <strong>Sample Size Formula (Paired Design):</strong><br><br>
+          n = 2(z<sub>α/2</sub> + z<sub>β</sub>)²σ² / δ²<br><br>
+          where:<br>
+          • σ = standard deviation of differences<br>
+          • δ = minimum detectable difference<br>
+          • z<sub>α/2</sub> = two-sided critical value<br>
+          • z<sub>β</sub> = power
+        </div>")
+    } else {
+      HTML("
+        <div style='font-family: monospace; padding: 15px; background-color: #f8f9fa; border-radius: 5px;'>
+          <strong>Sample Size Formula (Two Independent Groups):</strong><br><br>
+          n₁ = (1 + 1/r)(z<sub>α/2</sub> + z<sub>β</sub>)²σ² / δ²<br><br>
+          where:<br>
+          • r = n₂/n₁ (allocation ratio)<br>
+          • σ = common standard deviation<br>
+          • δ = minimum detectable difference<br>
+          • z<sub>α/2</sub> = two-sided critical value<br>
+          • z<sub>β</sub> = power
+        </div>")
+    }
+  } else if(outcome == "survival") {
+    HTML("
+      <div style='font-family: monospace; padding: 15px; background-color: #f8f9fa; border-radius: 5px;'>
+        <strong>Sample Size Formula (Survival Analysis):</strong><br><br>
+        n = (z<sub>α/2</sub> + z<sub>β</sub>)² / (p₀(1-p₀)(log HR)²(1-d))<br><br>
+        where:<br>
+        • p₀ = event rate in control group<br>
+        • HR = hazard ratio<br>
+        • d = dropout rate<br>
+        • z<sub>α/2</sub> = two-sided critical value<br>
+        • z<sub>β</sub> = power
+      </div>")
+  }
+}
+
+tooltip_content <- list(
+  ss_design = HTML("
+    <strong>Study Design:</strong><br>
+    - <u>Cohort Study:</u> Following groups over time from exposure to outcome<br>
+    - <u>Case-Control:</u> Comparing past exposures between cases and controls<br>
+    - <u>Cross-sectional:</u> Measuring exposure and outcome at one time point<br>
+    - <u>Clinical Trial:</u> Randomized intervention study<br>
+    Different designs require different sample size calculations due to their underlying assumptions.
+  "),
+  
+  ss_outcome = HTML("
+    <strong>Outcome Type:</strong><br>
+    - <u>Binary:</u> Yes/no outcome (e.g., disease status)<br>
+    - <u>Continuous:</u> Measured values (e.g., blood pressure)<br>
+    - <u>Time-to-event:</u> Duration until event occurs<br>
+    The outcome type determines which statistical test and power calculation method to use.
+  "),
+  
+  ss_alpha = HTML("
+    <strong>Type I Error (α):</strong><br>
+    - Probability of falsely rejecting the null hypothesis<br>
+    - Conventional level is 0.05 (5% false positive rate)<br>
+    - More stringent values (e.g., 0.01) reduce false positives but require larger sample sizes
+  "),
+  
+  ss_power = HTML("
+    <strong>Power (1-β):</strong><br>
+    - Probability of detecting a true effect if one exists<br>
+    - Conventional level is 0.80 (80% chance of detection)<br>
+    - Higher power (e.g., 0.90) requires larger sample sizes<br>
+    - β is the Type II error rate (false negative rate)
+  "),
+  
+  ss_or = HTML("
+    <strong>Odds Ratio:</strong><br>
+    - Measure of association in case-control studies<br>
+    - OR = 1: No association<br>
+    - OR > 1: Positive association<br>
+    - OR < 1: Negative association<br>
+    Smaller differences from 1.0 require larger sample sizes to detect.
+  ")
+)
+
 # UI definition
 ui <- dashboardPage(
   skin = "green",
@@ -68,6 +481,7 @@ ui <- dashboardPage(
     sidebarMenu(
       menuItem("How-to Guide", tabName = "howto", icon = icon("question-circle")),
       menuItem("Analysis Guide", tabName = "guide", icon = icon("dashboard")),
+      menuItem("Sample Size & Power", tabName = "samplesize", icon = icon("calculator")),
       menuItem("Study Design", tabName = "design", icon = icon("clipboard")),
       menuItem("Glossary", tabName = "glossary", icon = icon("book")),
       menuItem("About", tabName = "about", icon = icon("info"))
@@ -395,11 +809,13 @@ ui <- dashboardPage(
                       numericInput("matchRatio",
                                    "What is the matching ratio (controls per case)?",
                                    value = 1,
-                                   min = 1),
+                                   min = 1
+                      ),
                       conditionalPanel(
                         condition = "input.matchRatio > 4",
                         div(style = "color: #856404; background-color: #fff3cd; padding: 8px; border: 1px solid #ffeeba; border-radius: 4px;",
-                            HTML("<small><i class='fas fa-info-circle'></i> Statistical efficiency gains diminish rapidly beyond 4 controls per case due to marginal information added.</small>"))
+                            HTML("<small><i class='fas fa-info-circle'></i> Statistical efficiency gains diminish rapidly beyond 4 controls per case due to marginal information added.</small>")
+                        )
                       )
                     )
                   ),
@@ -414,25 +830,9 @@ ui <- dashboardPage(
                                min = 1
                   ),
                   
-                  # Outcome variable type with conditional display
                   conditionalPanel(
-                    condition = "input.studyDesign != 'case_control' && input.studyDesign != 'nested_cc'",
-                    radioButtons("outcomeType", "What is your outcome variable type?",
-                                 choices = c(
-                                   "Continuous (e.g., blood pressure, BMI)" = "continuous",
-                                   "Binary (e.g., disease yes/no)" = "binary",
-                                   "Time-to-event (e.g., survival data)" = "survival",
-                                   "Count data (e.g., number of cases)" = "count",
-                                   "Ordinal (e.g., disease severity)" = "ordinal"
-                                 ))
-                  ),
-                  conditionalPanel(
-                    condition = "input.studyDesign == 'case_control' || input.studyDesign == 'nested_cc'",
-                    radioButtons("outcomeType", "What is your outcome variable type?",
-                                 choices = c(
-                                   "Binary (case-control status)" = "binary"
-                                 ),
-                                 selected = "binary")
+                    condition = "input.studyDesign",
+                    uiOutput("outcomeTypeUI")
                   ),
                   
                   # Predictor type question
@@ -499,6 +899,158 @@ ui <- dashboardPage(
               )
       ),
       
+      # Sample Size Tab
+      # Find the tabItem for "samplesize" and replace it with:
+      tabItem(tabName = "samplesize",
+              fluidRow(
+                box(
+                  width = 12,
+                  title = "Sample Size & Power Calculator",
+                  status = "primary",
+                  solidHeader = TRUE,
+                  
+                  # Calculator mode selection
+                  div(
+                    style = "margin-bottom: 20px;",
+                    radioButtons("calc_mode", "What would you like to calculate?",
+                                 choices = c(
+                                   "Sample Size (given desired power)" = "sample_size",
+                                   "Power (given sample size)" = "power"
+                                 ),
+                                 selected = "sample_size"
+                    )
+                  ),
+                  
+                  # Study design selection with tooltip
+                  div(
+                    style = "margin-bottom: 20px;",
+                    selectInput("ss_design", 
+                                label = span(
+                                  "Study Design",
+                                  tags$i(class = "fas fa-info-circle",
+                                         style = "margin-left: 5px; cursor: pointer;",
+                                         `data-toggle` = "tooltip",
+                                         `data-html` = "true",
+                                         title = tooltip_content$ss_design)
+                                ),
+                                choices = c(
+                                  "Cohort Study" = "cohort",
+                                  "Case-Control Study" = "case_control",
+                                  "Cross-sectional Study" = "cross_sectional",
+                                  "Clinical Trial (Parallel)" = "rct_parallel",
+                                  "Clinical Trial (Crossover)" = "rct_crossover"
+                                )
+                    )
+                  ),
+                  
+                  # Outcome type selection with tooltip
+                  div(
+                    style = "margin-bottom: 20px;",
+                    selectInput("ss_outcome", 
+                                label = span(
+                                  "Outcome Type",
+                                  tags$i(class = "fas fa-info-circle",
+                                         style = "margin-left: 5px; cursor: pointer;",
+                                         `data-toggle` = "tooltip",
+                                         `data-html` = "true",
+                                         title = tooltip_content$ss_outcome)
+                                ),
+                                choices = c(
+                                  "Binary (e.g., disease yes/no)" = "binary",
+                                  "Continuous (e.g., blood pressure)" = "continuous",
+                                  "Time-to-event" = "survival"
+                                )
+                    )
+                  ),
+                  
+                  # Matching and test type selection for case-control studies
+                  conditionalPanel(
+                    condition = "input.ss_design == 'case_control'",
+                    div(
+                      style = "margin-bottom: 20px;",
+                      radioButtons("ss_match_design",
+                                   "Matching Design:",
+                                   choices = c(
+                                     "Unmatched case-control" = "unmatched",
+                                     "Matched case-control" = "matched"
+                                   ),
+                                   selected = "unmatched"
+                      )
+                    ),
+                    div(
+                      style = "margin-bottom: 20px;",
+                      radioButtons("ss_sided_test",
+                                   "Test Type:",
+                                   choices = c(
+                                     "One-sided test" = "one",
+                                     "Two-sided test" = "two"
+                                   ),
+                                   selected = "one"
+                      )
+                    )
+                  ),
+                  
+                  # Common parameters with tooltips
+                  numericInput("ss_alpha", 
+                               label = span(
+                                 "Type I Error (α)",
+                                 tags$i(class = "fas fa-info-circle",
+                                        style = "margin-left: 5px; cursor: pointer;",
+                                        `data-toggle` = "tooltip",
+                                        `data-html` = "true",
+                                        title = tooltip_content$ss_alpha)
+                               ),
+                               value = 0.05,
+                               min = 0.01,
+                               max = 0.1,
+                               step = 0.01),
+                  
+                  # Calculation mode specific inputs with tooltips
+                  conditionalPanel(
+                    condition = "input.calc_mode == 'power'",
+                    numericInput("ss_n", 
+                                 label = span(
+                                   "Total Sample Size",
+                                   tags$i(class = "fas fa-info-circle",
+                                          style = "margin-left: 5px; cursor: pointer;",
+                                          `data-toggle` = "tooltip",
+                                          `data-html` = "true",
+                                          title = "The total number of participants in your study. This should include all groups or arms of the study combined.")
+                                 ),
+                                 value = 100,
+                                 min = 2,
+                                 step = 1)
+                  ),
+                  
+                  conditionalPanel(
+                    condition = "input.calc_mode == 'sample_size'",
+                    numericInput("ss_power", 
+                                 label = span(
+                                   "Desired Power (1-β)",
+                                   tags$i(class = "fas fa-info-circle",
+                                          style = "margin-left: 5px; cursor: pointer;",
+                                          `data-toggle` = "tooltip",
+                                          `data-html` = "true",
+                                          title = tooltip_content$ss_power)
+                                 ),
+                                 value = 0.80,
+                                 min = 0.6,
+                                 max = 0.99,
+                                 step = 0.05)
+                  ),
+                  
+                  # Dynamic parameter inputs
+                  uiOutput("ss_params"),
+                  
+                  # Equation display
+                  uiOutput("equation_display"),
+                  
+                  # Results display
+                  uiOutput("ss_results")
+                )
+              )
+      ),
+      
       # Study Design Tab
       tabItem(tabName = "design",
               fluidRow(
@@ -512,6 +1064,7 @@ ui <- dashboardPage(
               )
       ),
       
+      # Glossary Tab
       tabItem(tabName = "glossary",
               fluidRow(
                 box(
@@ -534,12 +1087,407 @@ ui <- dashboardPage(
                 "Developed using R Shiny by epidemiologists for epidemiologists."
               )
       )
-    )
-  )
-)
+    )  # Add this to close tabItems()
+  )  # Add this to close dashboardBody()
+)  # Add this to close dashboardPage()
 
 # Server logic
 server <- function(input, output, session) {  # Added session parameter here
+  
+  # Initialize reactive values
+  rv <- reactiveValues(
+    params_ready = FALSE,
+    calculation_inputs = NULL
+  )
+  
+  observe({
+    # Track parameter readiness
+    req(input$ss_design, input$ss_outcome, input$calc_mode)
+    
+    # Initialize inputs list
+    inputs <- list(
+      design = input$ss_design,
+      outcome = input$ss_outcome,
+      mode = input$calc_mode,
+      alpha = input$ss_alpha
+    )
+    
+    # Add mode-specific parameters
+    if(input$calc_mode == "power") {
+      req(input$ss_n)
+      inputs$sample_size <- as.numeric(input$ss_n)
+    } else {
+      req(input$ss_power)
+      inputs$power <- as.numeric(input$ss_power)
+    }
+    
+    # Add this line to explicitly capture the sided_test parameter
+    if(input$ss_design == "case_control") {
+      inputs$sided_test <- input$ss_sided_test
+    }
+    
+    # Validate all required inputs are present and numeric
+    tryCatch({
+      # Add outcome-specific parameters
+      if(input$ss_outcome == "binary") {
+        if(input$ss_design == "case_control") {
+          req(input$ss_or, input$ss_p0, input$ss_ratio)
+          inputs$or <- as.numeric(input$ss_or)
+          inputs$p0 <- as.numeric(input$ss_p0)
+          inputs$ratio <- as.numeric(input$ss_ratio)
+          inputs$sided_test <- input$ss_sided_test %||% "one"
+          inputs$match_design <- input$ss_match_design %||% "unmatched"
+          
+          if(inputs$match_design == "matched") {
+            req(input$ss_phi)
+            inputs$phi <- as.numeric(input$ss_phi)
+          }
+        } else if(input$ss_design %in% c("cohort", "cross_sectional", "rct_parallel")) {
+          req(input$ss_p0, input$ss_p1)
+          inputs$p0 <- as.numeric(input$ss_p0)
+          inputs$p1 <- as.numeric(input$ss_p1)
+        }
+      } else if(input$ss_outcome == "continuous") {
+        req(input$ss_diff, input$ss_sd)
+        inputs$diff <- as.numeric(input$ss_diff)
+        inputs$sd <- as.numeric(input$ss_sd)
+        if(input$ss_design != "rct_crossover") {
+          req(input$ss_ratio)
+          inputs$ratio <- as.numeric(input$ss_ratio)
+        }
+      } else if(input$ss_outcome == "survival") {
+        req(input$ss_hr, input$ss_p0, input$ss_dropouts)
+        inputs$hr <- as.numeric(input$ss_hr)
+        inputs$p0 <- as.numeric(input$ss_p0)
+        inputs$dropouts <- as.numeric(input$ss_dropouts)
+      }
+      
+      # If we get here, all inputs are valid
+      rv$calculation_inputs <- inputs
+      rv$params_ready <- TRUE
+      
+    }, error = function(e) {
+      rv$params_ready <- FALSE
+    })
+  })
+  
+  # Initialize tooltips for dynamic content
+  observe({
+    # Ensure tooltips are initialized after any dynamic content loads
+    session$sendCustomMessage(type = "handler-tooltip-init", message = list())
+  })
+  
+  observe({
+    # Force binary outcome for case-control studies in sample size calculator
+    if(input$ss_design == "case_control" && 
+       !is.null(input$ss_outcome) && 
+       input$ss_outcome != "binary") {
+      updateSelectInput(session, 
+                        "ss_outcome",
+                        selected = "binary")
+      showNotification(
+        "Case-control studies can only have binary outcomes. Outcome type has been updated.",
+        type = "warning",
+        duration = 5
+      )
+    }
+  })
+  
+  # Add the equation display output:
+  output$equation_display <- renderUI({
+    equation_display(input$ss_design, input$ss_outcome)
+  })
+  
+  # Render the parameter inputs UI
+  output$ss_params <- renderUI({
+    req(input$ss_design, input$ss_outcome, input$calc_mode)
+    
+    params <- list()
+    
+    if(input$ss_design == "case_control") {
+      
+      params$or <- div(
+        style = "margin-bottom: 20px;",
+        numericInput("ss_or",
+                     "Minimum detectable odds ratio:",
+                     value = 2.0,
+                     min = 1.1,
+                     max = 10,
+                     step = 0.1)
+      )
+      
+      params$p0 <- div(
+        style = "margin-bottom: 20px;",
+        numericInput("ss_p0",
+                     "Expected exposure prevalence in controls:",
+                     value = 0.1,
+                     min = 0.001,
+                     max = 0.999,
+                     step = 0.01)
+      )
+      
+      params$ratio <- div(
+        style = "margin-bottom: 20px;",
+        numericInput("ss_ratio",
+                     "Control to case ratio:",
+                     value = 1,
+                     min = 0.5,
+                     max = 4,
+                     step = 0.5)
+      )
+    } else if(input$ss_outcome == "binary" && 
+                input$ss_design %in% c("cohort", "cross_sectional", "rct_parallel")) {
+      params$p0 <- div(
+        style = "margin-bottom: 20px;",
+        numericInput("ss_p0",
+                     label = span(
+                       "Probability in Unexposed/Control Group (p₀)",
+                       tags$i(class = "fas fa-info-circle",
+                              style = "margin-left: 5px; cursor: pointer;",
+                              `data-toggle` = "tooltip",
+                              `data-html` = "true",
+                              title = "Expected probability of outcome in the unexposed/control group")
+                     ),
+                     value = 0.1,
+                     min = 0.001,
+                     max = 0.999,
+                     step = 0.01)
+      )
+      
+      params$p1 <- div(
+        style = "margin-bottom: 20px;",
+        numericInput("ss_p1",
+                     label = span(
+                       "Probability in Exposed/Treatment Group (p₁)",
+                       tags$i(class = "fas fa-info-circle",
+                              style = "margin-left: 5px; cursor: pointer;",
+                              `data-toggle` = "tooltip",
+                              `data-html` = "true",
+                              title = "Expected probability of outcome in the exposed/treatment group")
+                     ),
+                     value = 0.2,
+                     min = 0.001,
+                     max = 0.999,
+                     step = 0.01)
+      )
+      
+      params$effect_note <- div(
+        style = "margin-bottom: 20px; color: #666; font-style: italic; padding-left: 20px;",
+        sprintf("Based on your entered probabilities:\n
+          Risk Difference = %.3f\n
+          Relative Risk = %.2f", 
+                input$ss_p1 - input$ss_p0,
+                input$ss_p1/input$ss_p0)
+      )
+      
+      params$ratio <- div(
+        style = "margin-bottom: 20px;",
+        numericInput("ss_ratio",
+                     "Group allocation ratio (n₂/n₁):",
+                     value = 1,
+                     min = 0.5,
+                     max = 4,
+                     step = 0.5)
+      )
+    }    else if(input$ss_outcome == "continuous") {
+      params$effect_size <- div(
+        style = "margin-bottom: 20px;",
+        numericInput("ss_effect_size",
+                     label = span(
+                       "Effect Size (Cohen's d)",
+                       tags$i(class = "fas fa-info-circle",
+                              style = "margin-left: 5px; cursor: pointer;",
+                              `data-toggle` = "tooltip",
+                              `data-html` = "true",
+                              title = "Standardized effect size (difference in means divided by pooled standard deviation). Around 0.2 is small, 0.5 is medium, 0.8 is large.")
+                     ),
+                     value = 0.5,
+                     min = 0.1,
+                     max = 2.0,
+                     step = 0.1)
+      )
+      
+      params$diff <- div(
+        style = "margin-bottom: 20px;",
+        numericInput("ss_diff",
+                     "Minimum detectable difference:",
+                     value = 0.5,
+                     min = 0.1,
+                     max = 100,
+                     step = 0.1)
+      )
+      
+      params$sd <- div(
+        style = "margin-bottom: 20px;",
+        numericInput("ss_sd",
+                     "Expected standard deviation:",
+                     value = 1,
+                     min = 0.1,
+                     max = 100,
+                     step = 0.1)
+      )
+      
+      if(input$ss_design != "rct_crossover") {
+        params$ratio <- div(
+          style = "margin-bottom: 20px;",
+          numericInput("ss_ratio",
+                       "Group allocation ratio (n2/n1):",
+                       value = 1,
+                       min = 0.5,
+                       max = 4,
+                       step = 0.5)
+        )
+      }
+    } else if(input$ss_outcome == "survival") {
+      params$hr <- div(
+        style = "margin-bottom: 20px;",
+        numericInput("ss_hr",
+                     "Minimum detectable hazard ratio:",
+                     value = 0.7,
+                     min = 0.1,
+                     max = 2,
+                     step = 0.05)
+      )
+      
+      params$p0 <- div(
+        style = "margin-bottom: 20px;",
+        numericInput("ss_p0",
+                     "Expected event rate in control group:",
+                     value = 0.3,
+                     min = 0.01,
+                     max = 0.99,
+                     step = 0.05)
+      )
+      
+      params$dropouts <- div(
+        style = "margin-bottom: 20px;",
+        numericInput("ss_dropouts",
+                     "Expected dropout rate:",
+                     value = 0.1,
+                     min = 0,
+                     max = 0.5,
+                     step = 0.05)
+      )
+    }
+    
+    # Conditionally add phi parameter for matched case-control studies
+    if(!is.null(input$ss_match_design) && input$ss_match_design == "matched") {
+      params$phi <- div(
+        style = "margin-bottom: 20px;",
+        numericInput("ss_phi",
+                     "Within-pair correlation of exposure (φ):",
+                     value = 0.2,
+                     min = 0,
+                     max = 1,
+                     step = 0.1)
+      )
+    }
+    
+    # Return all parameters
+    do.call(tagList, params)
+  })
+  
+  # Render results
+  output$ss_results <- renderUI({
+    req(rv$params_ready, rv$calculation_inputs)
+    
+    tryCatch({
+      # Calculate based on selected mode
+      results <- if(rv$calculation_inputs$mode == "sample_size") {
+        calculate_sample_size(rv$calculation_inputs$design, 
+                              rv$calculation_inputs$outcome, 
+                              rv$calculation_inputs)
+      } else {
+        calculate_power(rv$calculation_inputs$design, 
+                        rv$calculation_inputs$outcome, 
+                        rv$calculation_inputs)
+      }
+      
+      # Display results
+      div(
+        class = "well",
+        h4(if(rv$calculation_inputs$mode == "sample_size") 
+          "Sample Size Calculation Results" 
+          else "Power Calculation Results"),
+        tags$ul(
+          lapply(names(results), function(name) {
+            if(name != "method") {
+              tags$li(
+                strong(gsub("_", " ", tools::toTitleCase(name)), ": "),
+                results[[name]]
+              )
+            }
+          }),
+          tags$li(
+            strong("Method: "),
+            results$method
+          )
+        ),
+        tags$div(
+          class = "alert alert-info",
+          HTML("<strong>Note:</strong> These calculations assume:
+        <ul>
+          <li>Independent observations</li>
+          <li>No adjustment for covariates or multiple comparisons</li>
+          <li>Complete data collection</li>
+        </ul>
+        Consider increasing the calculated sample size by 10-20% to account for potential losses.")
+        )
+      )
+    }, error = function(e) {
+      div(
+        class = "alert alert-danger",
+        icon("exclamation-circle"),
+        "Unable to calculate results. Please check your inputs and try again.",
+        tags$br(),
+        tags$small(class = "text-muted", "Error details: ", e$message)
+      )
+    })
+  })
+  
+  # Add this new output definition
+  output$outcomeTypeUI <- renderUI({
+    # Define available outcome choices based on study design
+    outcome_choices <- if(input$studyDesign == "cross_sectional") {
+      # Cross-sectional studies can't measure time-to-event outcomes
+      c(
+        "Continuous (e.g., blood pressure, BMI)" = "continuous",
+        "Binary (e.g., disease yes/no)" = "binary",
+        "Count data (e.g., number of cases)" = "count",
+        "Ordinal (e.g., disease severity)" = "ordinal"
+      )
+    } else if(input$studyDesign %in% c("case_control", "nested_cc")) {
+      # Case-control studies must have binary outcomes
+      c("Binary (case-control status)" = "binary")
+    } else {
+      # All outcome types available for other designs
+      c(
+        "Continuous (e.g., blood pressure, BMI)" = "continuous",
+        "Binary (e.g., disease yes/no)" = "binary",
+        "Time-to-event (e.g., survival data)" = "survival",
+        "Count data (e.g., number of cases)" = "count",
+        "Ordinal (e.g., disease severity)" = "ordinal"
+      )
+    }
+    
+    # Create the radio buttons
+    radioButtons("outcomeType", 
+                 "What is your outcome variable type?",
+                 choices = outcome_choices)
+  })
+  
+  # Add this new validation observer
+  observe({
+    # If user somehow selects an invalid combination
+    if(input$studyDesign == "cross_sectional" && !is.null(input$outcomeType) && input$outcomeType == "survival") {
+      showNotification(
+        "Time-to-event outcomes cannot be measured in cross-sectional studies. Please select a different outcome type.",
+        type = "warning"
+      )
+      # Reset outcome type
+      updateRadioButtons(session, "outcomeType", selected = character(0))
+    }
+  })
   
   output$glossaryTable <- DT::renderDataTable({
     data.frame(
@@ -608,32 +1556,38 @@ server <- function(input, output, session) {  # Added session parameter here
   
   # Dynamic effect measure UI
   output$effectMeasureUI <- renderUI({
+    
+    # Add early return if study design is not yet selected
+    if(is.null(input$studyDesign)) {
+      return()
+    }
+    
     # Define which study designs allow difference measures
     difference_allowed <- input$studyDesign %in% c("cohort", "rct", "cross_sectional", "ecological")
     
     # Define measure availability by outcome type
     measure_availability <- if(!is.null(input$outcomeType)) {
       switch(input$outcomeType,
-             "survival" = list(allowed = "ratio", message = "Only ratio measures (hazard ratios) are available for survival analysis"),
+             "survival" = list(allowed = "both", message = "Both difference and ratio measures are available for survival analysis"),
              "count" = list(allowed = "ratio", message = "Only ratio measures (rate ratios) are available for count data"),
              "ordinal" = list(allowed = "ratio", message = "Only ratio measures (proportional odds ratios) are available for ordinal outcomes"),
              list(allowed = "both", message = NULL)
       )
     } else {
-      list(allowed = "both", message = NULL)
+      return()  # Return early if outcome type not yet selected
     }
     
     # Combine study design and outcome type constraints
     final_allowed <- if(measure_availability$allowed == "ratio") {
       "ratio"
-    } else if(!difference_allowed) {
+    } else if(!difference_allowed && input$outcomeType != "survival") {
       "ratio"
     } else {
       "both"
     }
     
-    # Generate explanation text
-    explanation <- if(!difference_allowed) {
+    # Generate explanation text with NULL check
+    explanation <- if(!difference_allowed && input$outcomeType != "survival") {
       switch(input$studyDesign,
              "case_control" = "Difference measures cannot be estimated from case-control studies (odds differences are not interpretable)",
              "nested_cc" = "Difference measures cannot be estimated from nested case-control studies (rate differences require full cohort data)",
@@ -644,13 +1598,23 @@ server <- function(input, output, session) {  # Added session parameter here
       measure_availability$message
     }
     
+    # Create choices with appropriate labels for survival outcomes
+    choices <- if(!is.null(input$outcomeType) && input$outcomeType == "survival") {
+      c(
+        "Difference measure (median survival time difference)" = "difference",
+        "Ratio measure (hazard ratio)" = "ratio"
+      )
+    } else {
+      c(
+        "Difference measure (e.g., risk difference, rate difference)" = "difference",
+        "Ratio measure (e.g., risk ratio, rate ratio)" = "ratio"
+      )
+    }
+    
     tagList(
       radioButtons("effectMeasure", 
                    "What type of effect measure do you want to estimate?",
-                   choices = c(
-                     "Difference measure (e.g., risk difference, rate difference)" = "difference",
-                     "Ratio measure (e.g., risk ratio, rate ratio)" = "ratio"
-                   ),
+                   choices = choices,
                    selected = if(final_allowed == "ratio") "ratio" else NULL),
       if(!is.null(explanation)) {
         div(class = "measure-note", 
@@ -665,26 +1629,33 @@ server <- function(input, output, session) {  # Added session parameter here
     # Disable difference measure if not allowed
     if(!is.null(input$studyDesign)) {
       difference_allowed <- input$studyDesign %in% c("cohort", "rct", "cross_sectional", "ecological")
-      if(!difference_allowed && input$effectMeasure == "difference") {
+      if(!difference_allowed && input$effectMeasure == "difference" && input$outcomeType != "survival") {  # Added survival check
         updateRadioButtons(session, "effectMeasure", selected = "ratio")
       }
     }
     
     # Enforce outcome-specific constraints
     if(!is.null(input$outcomeType)) {
-      ratio_only <- input$outcomeType %in% c("survival", "count", "ordinal")
+      ratio_only <- input$outcomeType %in% c("count", "ordinal")  # Removed "survival" from this list
       if(ratio_only && input$effectMeasure == "difference") {
         updateRadioButtons(session, "effectMeasure", selected = "ratio")
       }
     }
     
     # Force binary outcome for case-control studies
-    if(input$studyDesign %in% c("case_control", "nested_cc")) {
+    if(input$studyDesign %in% c("case_control", "nested_cc") && 
+       !is.null(input$outcomeType) && 
+       input$outcomeType != "binary") {
       updateRadioButtons(session, 
                          "outcomeType",
                          selected = "binary")
+      showNotification(
+        "Case-control studies can only have binary outcomes. Outcome type has been updated.",
+        type = "warning",
+        duration = 5
+      )
     }
-  })  # Close observe
+  })
   
   # Study design guidance table
   output$designTable <- DT::renderDataTable({
@@ -714,7 +1685,15 @@ server <- function(input, output, session) {  # Added session parameter here
   }, options = list(pageLength = 7))
   
   # Analysis results UI
+  
   output$analysisResult <- renderUI({
+    # First check if we have all required inputs
+    if(is.null(input$outcomeType) || is.null(input$studyDesign)) {
+      return(HTML("<div class='alert alert-info'>
+        Please complete the selections above to see analysis recommendations.
+      </div>"))
+    }
+    
     # Check if sample size is missing or not numeric
     if(is.null(input$sampleSize) || is.na(input$sampleSize)) {
       return(HTML("<div class='alert alert-warning'>
@@ -726,12 +1705,12 @@ server <- function(input, output, session) {  # Added session parameter here
     if((input$studyDesign %in% c("case_control", "nested_cc")) && 
        input$outcomeType != "binary") {
       return(HTML("<div class='alert alert-warning'>
-    <strong>⚠️ Error:</strong> Case-control studies must have binary outcomes.
-    Please select 'Binary' as the outcome type.
-  </div>"))
+        <strong>⚠️ Error:</strong> Case-control studies must have binary outcomes.
+        Please select 'Binary' as the outcome type.
+      </div>"))
     }
     
-    # Existing sample size warning
+    # Get sample size warning if needed
     sample_size_warning <- if(input$sampleSize < 30) {
       "<div class='alert alert-warning'>
         <strong>⚠️ Small Sample Size Warning:</strong> Consider non-parametric methods and exact tests.
@@ -740,14 +1719,18 @@ server <- function(input, output, session) {  # Added session parameter here
       ""
     }
     
-    # Main analysis recommendations based on outcome type
-    main_analysis_md <- switch(input$outcomeType,
-                               "continuous" = get_continuous_analysis_md(input$predictorType, input$groupNum),
-                               "binary" = get_binary_analysis_md(input$studyDesign, input$predictorType, input$effectMeasure, input$matchingDesign),
-                               "survival" = get_survival_analysis_md(input$predictorType),
-                               "count" = get_count_analysis_md(),
-                               "ordinal" = get_ordinal_analysis_md(input$predictorType)
-    )
+    # Get the appropriate analysis recommendations
+    main_analysis_md <- if(!is.null(input$outcomeType)) {
+      switch(input$outcomeType,
+             "continuous" = get_continuous_analysis_md(input$predictorType, input$groupNum),
+             "binary" = get_binary_analysis_md(input$studyDesign, input$predictorType, input$effectMeasure, input$matchingDesign),
+             "survival" = get_survival_analysis_md(input$predictorType, input$effectMeasure),  # Add effect_measure parameter
+             "count" = get_count_analysis_md(),
+             "ordinal" = get_ordinal_analysis_md(input$predictorType),
+             "Please select an outcome type to see analysis recommendations.")
+    } else {
+      "Please select an outcome type to see analysis recommendations."
+    }
     
     # Get justification text with proper error handling
     justification_text <- tryCatch({
@@ -763,40 +1746,32 @@ server <- function(input, output, session) {  # Added session parameter here
     })
     
     # Get effect measure interpretation
-    effect_interpretation <- get_effect_measure_interpretation(input$outcomeType, 
-                                                               input$studyDesign, 
-                                                               input$predictorType, 
-                                                               input$effectMeasure)
-    
-    
-    # Get R code template
-    r_code <- get_r_code_template(input$outcomeType, 
-                                  input$studyDesign, 
-                                  input$predictorType, 
-                                  input$effectMeasure,
-                                  if(!is.null(input$matchingDesign)) input$matchingDesign else "unmatched")
-    
-    # Additional considerations text
-    additional_considerations <- ""
-    additional_list <- list(
-      repeated = "### Repeated Measures Analysis
-- Mixed effects models
-- GEE (Generalized Estimating Equations)
-- Repeated measures ANOVA",
-      clustered = "### Clustering Adjustment
-- Multilevel/hierarchical models
-- Cluster-robust standard errors",
-      missing = "### Missing Data Handling
-- Multiple imputation
-- Sensitivity analyses
-- Complete case analysis (if MCAR)",
-      multiple_testing = "### Multiple Comparison Adjustment
-- Bonferroni correction
-- False Discovery Rate (FDR)
-- Holm's method"
+    effect_interpretation <- get_effect_measure_interpretation(
+      input$outcomeType, 
+      input$studyDesign, 
+      input$predictorType, 
+      input$effectMeasure
     )
     
+    # Get R code template
+    r_code <- get_r_code_template(
+      input$outcomeType, 
+      input$studyDesign, 
+      input$predictorType, 
+      input$effectMeasure,
+      if(!is.null(input$matchingDesign)) input$matchingDesign else "unmatched"
+    )
+    
+    # Process additional considerations
+    additional_considerations <- ""
     if(length(input$additionalConsiderations) > 0) {
+      additional_list <- list(
+        repeated = "### Repeated Measures Analysis\n- Mixed effects models\n- GEE\n- Repeated measures ANOVA",
+        clustered = "### Clustering Adjustment\n- Multilevel models\n- Cluster-robust standard errors",
+        missing = "### Missing Data Handling\n- Multiple imputation\n- Sensitivity analyses",
+        multiple_testing = "### Multiple Comparison Adjustment\n- Bonferroni correction\n- FDR\n- Holm's method"
+      )
+      
       additional_considerations <- paste(
         sapply(input$additionalConsiderations, 
                function(x) additional_list[[x]]),
@@ -909,7 +1884,7 @@ server <- function(input, output, session) {  # Added session parameter here
         return("### Primary Analysis
 - Conditional logistic regression
 - Accounts for matched sets through stratification
-- Matches treated as nuisance parameters
+- Matching variables treated as nuisance parameters
 
 ### Hypothesis Test
 - Wald test or likelihood ratio test (H₀: OR = 1)
@@ -1007,8 +1982,36 @@ server <- function(input, output, session) {  # Added session parameter here
     }
   }
   
-  get_survival_analysis_md <- function(predictor_type) {
-    return("### Primary Analysis
+  get_survival_analysis_md <- function(predictor_type, effect_measure) {
+    # Ensure effect_measure has a default value if not provided
+    if(is.null(effect_measure)) {
+      effect_measure <- "ratio"  # Default to ratio if not specified
+    }
+    
+    if(effect_measure == "difference") {
+      return("### Primary Analysis
+- Restricted mean survival time (RMST) differences
+- Median survival time differences using Kaplan-Meier estimates
+
+### Hypothesis Test
+- Test of survival curve equality using log-rank test
+- Confidence intervals for median differences via bootstrapping
+
+### Small Sample Alternative
+- Permutation tests for survival differences
+- Exact confidence intervals for median differences
+
+### Alternatives
+- Restricted mean survival time (RMST) differences at specific time points
+- Differences in survival probabilities at fixed time points
+- Pseudo-observation based regression for survival differences
+
+### Model Diagnostics
+- Assessment of censoring patterns between groups
+- Test of equality of censoring distributions
+- Evaluation of follow-up adequacy")
+    } else {
+      return("### Primary Analysis
 - Cox Proportional Hazards
 
 ### Hypothesis Test
@@ -1027,6 +2030,7 @@ server <- function(input, output, session) {  # Added session parameter here
 - Proportional hazards assumption
 - Schoenfeld residuals
 - Martingale residuals")
+    }
   }
   
   get_count_analysis_md <- function() {
@@ -1079,6 +2083,10 @@ server <- function(input, output, session) {  # Added session parameter here
       return("Please complete all required selections to generate justification text.")
     }
     
+    if(outcome_type == "survival" && effect_measure == "difference") {
+      return("Differences in median survival time provide an intuitive measure of treatment effect that is directly interpretable in the original time scale. Unlike hazard ratios, these differences maintain their interpretation even when proportional hazards is violated. The method requires estimation of the median survival in each group through Kaplan-Meier curves, with bootstrap resampling recommended for confidence interval construction. RMST differences offer an alternative when median survival is not reached in one or both groups. While survival differences may vary across follow-up time, they provide valuable complementary information to ratio measures for clinical decision making and communication of results to non-technical audiences.")
+    }
+    
     base_justification <- switch(outcome_type,
                                  "continuous" = {
                                    if(is.null(predictor_type)) return("Please select predictor type.")
@@ -1129,6 +2137,55 @@ server <- function(input, output, session) {  # Added session parameter here
     if(is.null(outcome_type) || is.null(study_design) || 
        is.null(predictor_type) || is.null(effect_measure)) {
       return("# R code template will be generated once all selections are made")
+    }
+    
+    if(outcome_type == "survival" && effect_measure == "difference") {
+      return("```r
+# Load required packages
+library(survival)
+library(boot)
+
+# Fit Kaplan-Meier curves
+km_fit <- survfit(Surv(time, event) ~ exposure, data = data)
+
+# Calculate median survival times
+med_surv <- summary(km_fit)$table[,'median']
+med_diff <- diff(med_surv)
+
+# Bootstrap function for confidence intervals
+boot_med_diff <- function(data, indices) {
+  # Resample data
+  boot_data <- data[indices,]
+  
+  # Fit KM curves to bootstrap sample
+  boot_km <- survfit(Surv(time, event) ~ exposure, data = boot_data)
+  boot_med <- summary(boot_km)$table[,'median']
+  
+  # Return median difference
+  return(diff(boot_med))
+}
+
+# Perform bootstrap
+boot_results <- boot(data = data, 
+                    statistic = boot_med_diff,
+                    R = 1000)
+
+# Calculate 95% CI
+ci <- boot.ci(boot_results, type = 'bca')
+
+# For RMST differences at specific timepoint
+library(survRM2)
+rmst_diff <- rmst2(time = data$time,
+                   status = data$event,
+                   arm = data$exposure,
+                   tau = max(data$time))
+
+# Visualize survival curves
+plot(km_fit, 
+     xlab = 'Time',
+     ylab = 'Survival Probability',
+     main = 'Kaplan-Meier Survival Curves')
+```")
     }
     
     base_code <- switch(outcome_type,
@@ -1234,7 +2291,7 @@ ord_model <- polr(ordered(outcome) ~ exposure + covariates,
       main_analysis_md <- switch(input$outcomeType,
                                  "continuous" = get_continuous_analysis_md(input$predictorType, input$groupNum),
                                  "binary" = get_binary_analysis_md(input$studyDesign, input$predictorType, input$effectMeasure),
-                                 "survival" = get_survival_analysis_md(input$predictorType),
+                                 "survival" = get_survival_analysis_md(input$predictorType, input$effectMeasure),  # Add effect_measure parameter
                                  "count" = get_count_analysis_md(),
                                  "ordinal" = get_ordinal_analysis_md(input$predictorType)
       )
